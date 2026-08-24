@@ -1,0 +1,413 @@
+import express, { Request, Response, NextFunction } from "express";
+import { createServer } from "http";
+import { Server, Socket } from "socket.io";
+import { Expo } from "expo-server-sdk";
+// import { setupFileLogger } from "./utils/logger";
+
+// setupFileLogger();
+
+const app = express();
+app.use(express.json());
+
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: "*" },
+});
+
+type ClientType = "control" | "app";
+
+interface ClientInfo {
+  socketId: string;
+  type: ClientType;
+  themeCode?: string;
+  pushToken?: string;
+  platform?: "android" | "ios";
+}
+
+const clients: Map<string, ClientInfo> = new Map();
+const themeToAppSocket: Map<string, string> = new Map();
+const themeToPushToken: Map<string, string> = new Map();
+
+const expo = new Expo();
+
+// -----------------------------
+// 유틸
+// -----------------------------
+type AsyncHandler = (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => Promise<void>;
+
+const asyncHandler =
+  (fn: AsyncHandler) => (req: Request, res: Response, next: NextFunction) =>
+    Promise.resolve(fn(req, res, next)).catch(next);
+
+function getSocketById(id: string): Socket | undefined {
+  return io.sockets.sockets.get(id);
+}
+
+function forceDisconnect(socketId: string, reason: string) {
+  const s = getSocketById(socketId);
+  if (s) {
+    try {
+      s.disconnect(true);
+      console.log("🧹 forceDisconnect:", { socketId, reason });
+    } catch (e) {
+      console.log("forceDisconnect error:", e);
+    }
+  }
+
+  // 맵 정리도 같이
+  const info = clients.get(socketId);
+  if (info?.type === "app" && info.themeCode) {
+    if (themeToAppSocket.get(info.themeCode) === socketId) {
+      themeToAppSocket.delete(info.themeCode);
+    }
+  }
+  clients.delete(socketId);
+}
+
+function notifyControls(payload: {
+  themeCode: string | null;
+  status: string;
+  data: any;
+}) {
+  for (const c of clients.values()) {
+    if (c.type === "control") {
+      io.to(c.socketId).emit("status", payload);
+    }
+  }
+}
+
+// ✅ “전부 stringify” 로그 (chatData 포함)
+// - 순환참조 터지면 try/catch로 안전하게
+// - chatData가 너무 길 때 파일 용량 폭증할 수 있어서 limit 옵션도 같이 둠
+function safeStringify(v: any, maxLen = 200_000) {
+  try {
+    const s = JSON.stringify(
+      v,
+      (_k, value) => {
+        if (typeof value === "bigint") return value.toString();
+        return value;
+      },
+      2
+    );
+    if (s.length > maxLen) return s.slice(0, maxLen) + "\n...<TRUNCATED>";
+    return s;
+  } catch (e) {
+    return `<<JSON.stringify failed: ${(e as any)?.message ?? e}>>`;
+  }
+}
+
+function logEventFull(label: string, obj: Record<string, any>) {
+  // logger.ts에 console.log가 파일로도 남는다는 전제
+  console.log(`🧾 ${label} FULL_JSON\n${safeStringify(obj)}\n🧾 END`);
+}
+
+// -----------------------------
+// 유틸: 푸시 전송 (기존 그대로)
+// -----------------------------
+async function sendPushToTheme(
+  themeCode: string,
+  title: string,
+  body: string,
+  data: Record<string, any> = {}
+): Promise<void> {
+  const token = themeToPushToken.get(themeCode);
+  if (!token) {
+    console.log("❌ PushToken not found for themeCode:", themeCode);
+    return;
+  }
+  if (!Expo.isExpoPushToken(token)) {
+    console.log("❌ Invalid Expo push token:", { themeCode, token });
+    return;
+  }
+
+  try {
+    const tickets = await expo.sendPushNotificationsAsync([
+      {
+        to: token,
+        sound: "default",
+        title,
+        body,
+        data,
+        channelId: "default-sound-high",
+        priority: "high" as const,
+      },
+    ]);
+    console.log("✅ Push tickets:", tickets);
+  } catch (err) {
+    console.log("❌ Push send error:", err);
+  }
+}
+
+// -----------------------------
+// 라우트
+// -----------------------------
+app.get("/", (_req: Request, res: Response) => {
+  res.send("✅ 소켓+푸시 서버 실행 중입니다!");
+});
+
+app.get(
+  "/who",
+  asyncHandler(async (_req, res) => {
+    const all = Array.from(clients.values()).map((c) => ({
+      socketId: c.socketId,
+      type: c.type,
+      themeCode: c.themeCode ?? null,
+      hasToken: !!c.pushToken,
+      platform: c.platform ?? null,
+      socketAlive: !!getSocketById(c.socketId),
+    }));
+
+    const tokens = Array.from(themeToPushToken.entries()).map(([t, v]) => ({
+      themeCode: t,
+      token: v,
+    }));
+
+    res.json({ clients: all, tokens });
+  })
+);
+
+app.get(
+  "/push/test",
+  asyncHandler(async (req, res) => {
+    const themeCode = String(req.query.theme ?? "");
+    if (!themeCode) {
+      res.status(400).json({ ok: false, error: "theme required" });
+      return;
+    }
+
+    await sendPushToTheme(themeCode, "테스트 알림", `테마 ${themeCode} 테스트`, {
+      kind: "test",
+      ts: Date.now(),
+    });
+
+    res.json({ ok: true });
+  })
+);
+
+// -----------------------------
+// 주기적 청소: 맵엔 있는데 실제 소켓이 없으면 제거(좀비 엔트리 청소)
+// -----------------------------
+setInterval(() => {
+  for (const [id, info] of clients.entries()) {
+    if (!getSocketById(id)) {
+      console.log("🧹 stale client entry removed:", {
+        socketId: id,
+        type: info.type,
+        themeCode: info.themeCode ?? null,
+      });
+
+      if (info.type === "app" && info.themeCode) {
+        if (themeToAppSocket.get(info.themeCode) === id) {
+          themeToAppSocket.delete(info.themeCode);
+        }
+      }
+      clients.delete(id);
+    }
+  }
+}, 30_000);
+
+// -----------------------------
+// 소켓 핸들러
+// -----------------------------
+io.on("connection", (socket: Socket) => {
+  console.log("🔌 Connected:", socket.id);
+
+  socket.on(
+    "register",
+    ({
+      type,
+      themeCode,
+      pushToken,
+      platform,
+    }: {
+      type: ClientType;
+      themeCode?: string;
+      pushToken?: string;
+      platform?: "android" | "ios";
+    }) => {
+      // ✅ app은 themeCode 필수 취급
+      if (type === "app" && !themeCode) {
+        console.log("❌ register rejected: app missing themeCode", socket.id);
+        return;
+      }
+
+      // ✅ 동일 themeCode app이 이미 있으면 "진짜로" 끊어버림(좀비 차단 핵심)
+      if (type === "app" && themeCode) {
+        const prevId = themeToAppSocket.get(themeCode);
+        if (prevId && prevId !== socket.id) {
+          forceDisconnect(prevId, `replaced by new app (${themeCode})`);
+        }
+      }
+
+      const info: ClientInfo = {
+        socketId: socket.id,
+        type,
+        themeCode: type === "app" ? themeCode : undefined,
+        pushToken: type === "app" ? pushToken : undefined,
+        platform: type === "app" ? platform : undefined,
+      };
+
+      clients.set(socket.id, info);
+
+      if (type === "app" && themeCode) {
+        themeToAppSocket.set(themeCode, socket.id);
+
+        if (pushToken) {
+          themeToPushToken.set(themeCode, pushToken);
+          console.log("🔐 pushToken 저장:", { themeCode, pushToken });
+        }
+
+        notifyControls({ themeCode, status: "appConnected", data: null });
+        console.log("🔔 Notified control: appConnected", { themeCode });
+      }
+
+      if (type === "control") {
+        const connectedThemes = Array.from(clients.values())
+          .filter((c) => c.type === "app" && c.themeCode)
+          .map((c) => ({
+            themeCode: c.themeCode!,
+            hasToken: !!c.pushToken,
+          }));
+
+        io.to(socket.id).emit("status", {
+          themeCode: null,
+          status: "initialAppConnections",
+          data: connectedThemes,
+        });
+
+        console.log("📤 Sent to control: initialAppConnections", {
+          count: connectedThemes.length,
+          themes: connectedThemes.map(
+            (x) => `${x.themeCode}:${x.hasToken ? "T" : "-"}`
+          ),
+        });
+      }
+
+      console.log("✅ Registered:", {
+        socketId: socket.id,
+        type,
+        themeCode: themeCode ?? null,
+        hasToken: !!pushToken,
+        platform: platform ?? null,
+      });
+    }
+  );
+
+  // ✅ toApp는 control만 허용
+  socket.on(
+    "toApp",
+    async ({
+      themeCode,
+      command,
+      data,
+      pushTitle,
+      pushBody,
+      push = true,
+    }: {
+      themeCode: string;
+      command: string;
+      data?: any;
+      pushTitle?: string;
+      pushBody?: string;
+      push?: boolean;
+    }) => {
+      const sender = clients.get(socket.id);
+      if (!sender || sender.type !== "control") {
+        console.log("🚫 toApp blocked (not control):", socket.id);
+        return;
+      }
+
+      // ✅ 여기서 “전부 stringify”
+      logEventFull("toApp", { from: socket.id, themeCode, command, data });
+
+      // ✅ 대표 app 1개만 전송
+      const appSocketId = themeToAppSocket.get(themeCode);
+      if (appSocketId) {
+        io.to(appSocketId).emit("command", { command, data });
+        console.log("📡 toApp sent:", { themeCode, command, to: appSocketId });
+      } else {
+        console.log("⚠️ toApp: no connected app", { themeCode, command });
+      }
+
+      // ✅ push 로직은 그대로 유지
+      if (push && command === "changeChat") {
+        try {
+          const title = pushTitle ?? " ";
+          const last = data?.chatData?.[data.chatData.length - 1];
+          const body = last?.data ?? pushBody ?? " ";
+          await sendPushToTheme(themeCode, title, body, {
+            kind: "command",
+            command,
+            data: data ?? null,
+            ts: Date.now(),
+          });
+          console.log("📨 Push sent:", { themeCode, command });
+        } catch (e) {
+          console.log("push error:", e);
+        }
+      }
+    }
+  );
+
+  // ✅ toControl은 app만 허용 + themeCode는 sender 기준으로 강제(위조 차단)
+  socket.on(
+    "toControl",
+    (payload: { themeCode?: string; status: string; data: any }) => {
+      const sender = clients.get(socket.id);
+      if (!sender || sender.type !== "app" || !sender.themeCode) {
+        console.log("🚫 toControl blocked (not registered app):", socket.id);
+        return;
+      }
+
+      const themeCode = sender.themeCode; // ✅ payload 무시하고 sender로 고정
+      const status = payload?.status;
+      const data = payload?.data;
+
+      // ✅ 여기서도 “전부 stringify”
+      logEventFull("toControl", { from: socket.id, themeCode, status, data });
+
+      notifyControls({ themeCode, status, data });
+
+      console.log("📡 toControl forwarded:", { themeCode, status });
+    }
+  );
+
+  socket.on("disconnect", (reason) => {
+    const info = clients.get(socket.id);
+
+    if (!info) {
+      console.log("❌ Disconnected (untracked):", { socketId: socket.id, reason });
+      return;
+    }
+
+    const { type, themeCode } = info;
+
+    if (type === "app" && themeCode) {
+      if (themeToAppSocket.get(themeCode) === socket.id) {
+        themeToAppSocket.delete(themeCode);
+      }
+      notifyControls({ themeCode, status: "appDisconnected", data: { reason } });
+      console.log("⚠️ Notified control: appDisconnected", { themeCode, reason });
+    }
+
+    clients.delete(socket.id);
+    console.log("❌ Disconnected:", {
+      socketId: socket.id,
+      type,
+      themeCode: themeCode ?? null,
+      reason,
+    });
+  });
+});
+
+// -----------------------------
+// 실행
+// -----------------------------
+const PORT = Number(process.env.PORT || 3000);
+httpServer.listen(PORT, "0.0.0.0", () => {
+  console.log("🚀 Socket 서버 실행:", { url: `http://localhost:${PORT}` });
+});
