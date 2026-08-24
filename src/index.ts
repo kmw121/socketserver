@@ -2,6 +2,16 @@ import express, { Request, Response, NextFunction } from "express";
 import { createServer } from "http";
 import { Server, Socket } from "socket.io";
 import { Expo } from "expo-server-sdk";
+import {
+  applyAction,
+  ClientSnapshot,
+  getAllThemeSnapshots,
+  getThemeSnapshot,
+  reconcileAppSnapshot,
+  seedThemeSnapshot,
+  StateAction,
+  ThemeSnapshot,
+} from "./stateStore";
 // import { setupFileLogger } from "./utils/logger";
 
 // setupFileLogger();
@@ -22,6 +32,7 @@ interface ClientInfo {
   themeCode?: string;
   pushToken?: string;
   platform?: "android" | "ios";
+  deviceId?: string;
 }
 
 const clients: Map<string, ClientInfo> = new Map();
@@ -77,6 +88,18 @@ function notifyControls(payload: {
     if (c.type === "control") {
       io.to(c.socketId).emit("status", payload);
     }
+  }
+}
+
+function broadcastSnapshot(snapshot: ThemeSnapshot, syncStatus: string) {
+  notifyControls({
+    themeCode: snapshot.themeCode,
+    status: "stateSnapshot",
+    data: { snapshot, syncStatus },
+  });
+  const appSocketId = themeToAppSocket.get(snapshot.themeCode);
+  if (appSocketId) {
+    io.to(appSocketId).emit("stateSnapshot", { snapshot, syncStatus });
   }
 }
 
@@ -223,12 +246,14 @@ io.on("connection", (socket: Socket) => {
       themeCode,
       pushToken,
       platform,
+      deviceId,
     }: {
       type: ClientType;
       themeCode?: string;
       pushToken?: string;
       platform?: "android" | "ios";
-    }) => {
+      deviceId?: string;
+    }, ack?: (response: any) => void) => {
       // ✅ app은 themeCode 필수 취급
       if (type === "app" && !themeCode) {
         console.log("❌ register rejected: app missing themeCode", socket.id);
@@ -249,6 +274,7 @@ io.on("connection", (socket: Socket) => {
         themeCode: type === "app" ? themeCode : undefined,
         pushToken: type === "app" ? pushToken : undefined,
         platform: type === "app" ? platform : undefined,
+        deviceId: type === "app" ? deviceId : undefined,
       };
 
       clients.set(socket.id, info);
@@ -279,6 +305,12 @@ io.on("connection", (socket: Socket) => {
           data: connectedThemes,
         });
 
+        io.to(socket.id).emit("status", {
+          themeCode: null,
+          status: "initialSnapshots",
+          data: getAllThemeSnapshots(),
+        });
+
         console.log("📤 Sent to control: initialAppConnections", {
           count: connectedThemes.length,
           themes: connectedThemes.map(
@@ -294,10 +326,71 @@ io.on("connection", (socket: Socket) => {
         hasToken: !!pushToken,
         platform: platform ?? null,
       });
+      ack?.({
+        status: "registered",
+        serverTime: Date.now(),
+        snapshot: themeCode ? getThemeSnapshot(themeCode) : null,
+      });
     }
   );
 
   // ✅ toApp는 control만 허용
+  // V2 control bootstrap: only fills themes that do not exist yet.
+  socket.on("seedState", (payload: ClientSnapshot, ack?: (response: any) => void) => {
+    const sender = clients.get(socket.id);
+    if (!sender || sender.type !== "control" || !payload?.themeCode) {
+      ack?.({ status: "rejected" });
+      return;
+    }
+    const snapshot = seedThemeSnapshot(payload);
+    broadcastSnapshot(snapshot, "seeded");
+    ack?.({ status: "seeded", snapshot });
+  });
+
+  // V2 reconnect reconciliation. Delayed reset commands are never replayed.
+  socket.on("appSync", (payload: ClientSnapshot, ack?: (response: any) => void) => {
+    const sender = clients.get(socket.id);
+    if (!sender || sender.type !== "app" || !sender.themeCode) {
+      ack?.({ status: "rejected" });
+      return;
+    }
+    const result = reconcileAppSnapshot({ ...payload, themeCode: sender.themeCode });
+    broadcastSnapshot(result.snapshot, result.status);
+    ack?.({ ...result, serverTime: Date.now() });
+  });
+
+  // V2 authoritative state changes. Commit first, broadcast second, ACK last.
+  socket.on(
+    "stateAction",
+    (
+      payload: { themeCode?: string; requestId: string; action: StateAction },
+      ack?: (response: any) => void
+    ) => {
+      const sender = clients.get(socket.id);
+      if (!sender || !payload?.requestId || !payload?.action) {
+        ack?.({ status: "rejected" });
+        return;
+      }
+      const themeCode = sender.type === "app" ? sender.themeCode : payload.themeCode;
+      if (!themeCode) {
+        ack?.({ status: "rejected" });
+        return;
+      }
+      const result = applyAction(themeCode, payload.requestId, payload.action);
+      if (result.snapshot) broadcastSnapshot(result.snapshot, result.status);
+      ack?.({ ...result, appOnline: themeToAppSocket.has(themeCode) });
+
+      if (payload.action.type === "appendChat" && sender.type === "control") {
+        const message = payload.action.message;
+        void sendPushToTheme(themeCode, " ", String(message.data || " "), {
+          kind: "chat",
+          message: message.data || "",
+          ts: Date.now(),
+        });
+      }
+    }
+  );
+
   socket.on(
     "toApp",
     async ({
