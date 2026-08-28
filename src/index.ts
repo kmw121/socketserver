@@ -1,5 +1,7 @@
 import express, { Request, Response, NextFunction } from "express";
+import fs from "fs";
 import { createServer } from "http";
+import path from "path";
 import { Server, Socket } from "socket.io";
 import { Expo } from "expo-server-sdk";
 import {
@@ -35,9 +37,48 @@ interface ClientInfo {
   deviceId?: string;
 }
 
+const pushTokenDataDir = path.join(process.cwd(), "data");
+const pushTokenPath =
+  process.env.HINT_PUSH_TOKEN_FILE ||
+  path.join(pushTokenDataDir, "push-tokens.json");
+const pushTokenTempPath = `${pushTokenPath}.tmp`;
+
+function loadPushTokens(): Map<string, string> {
+  try {
+    if (!fs.existsSync(pushTokenPath)) return new Map();
+    const parsed = JSON.parse(fs.readFileSync(pushTokenPath, "utf-8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return new Map();
+    }
+    return new Map(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, string] =>
+          typeof entry[0] === "string" && typeof entry[1] === "string"
+      )
+    );
+  } catch (error) {
+    console.log("Push token load failed:", error);
+    return new Map();
+  }
+}
+
+function persistPushTokens(tokens: Map<string, string>) {
+  try {
+    fs.mkdirSync(path.dirname(pushTokenPath), { recursive: true });
+    fs.writeFileSync(
+      pushTokenTempPath,
+      JSON.stringify(Object.fromEntries(tokens), null, 2),
+      "utf-8"
+    );
+    fs.renameSync(pushTokenTempPath, pushTokenPath);
+  } catch (error) {
+    console.log("Push token save failed:", error);
+  }
+}
+
 const clients: Map<string, ClientInfo> = new Map();
 const themeToAppSocket: Map<string, string> = new Map();
-const themeToPushToken: Map<string, string> = new Map();
+const themeToPushToken = loadPushTokens();
 
 const expo = new Expo();
 
@@ -197,7 +238,7 @@ async function sendPushToTheme(
         title,
         body,
         data,
-        channelId: "default-sound-high",
+        channelId: "chat-messages-v2",
         priority: "high" as const,
       },
     ]);
@@ -345,6 +386,7 @@ io.on("connection", (socket: Socket) => {
 
         if (pushToken) {
           themeToPushToken.set(themeCode, pushToken);
+          persistPushTokens(themeToPushToken);
           console.log("Push token stored:", { themeCode, hasToken: true });
         }
 
@@ -438,7 +480,9 @@ io.on("connection", (socket: Socket) => {
         return;
       }
       const result = applyAction(themeCode, payload.requestId, payload.action);
-      if (result.snapshot) broadcastSnapshot(result.snapshot, result.status);
+      if (result.snapshot && result.status !== "alreadyApplied") {
+        broadcastSnapshot(result.snapshot, result.status);
+      }
       sendAck(socket.id, "stateAction", ack, {
         ...result,
         appOnline: themeToAppSocket.has(themeCode),
