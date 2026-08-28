@@ -12,9 +12,9 @@ import {
   StateAction,
   ThemeSnapshot,
 } from "./stateStore";
-// import { setupFileLogger } from "./utils/logger";
+import { setupConsoleLogger } from "./utils/logger";
 
-// setupFileLogger();
+setupConsoleLogger();
 
 const app = express();
 app.use(express.json());
@@ -62,6 +62,7 @@ function forceDisconnect(socketId: string, reason: string) {
   const s = getSocketById(socketId);
   if (s) {
     try {
+      logEventFull("SOCKET OUT forceDisconnect", { to: socketId, reason });
       s.disconnect(true);
       console.log("🧹 forceDisconnect:", { socketId, reason });
     } catch (e) {
@@ -86,7 +87,7 @@ function notifyControls(payload: {
 }) {
   for (const c of clients.values()) {
     if (c.type === "control") {
-      io.to(c.socketId).emit("status", payload);
+      emitToSocket(c.socketId, "control", "status", payload);
     }
   }
 }
@@ -99,18 +100,28 @@ function broadcastSnapshot(snapshot: ThemeSnapshot, syncStatus: string) {
   });
   const appSocketId = themeToAppSocket.get(snapshot.themeCode);
   if (appSocketId) {
-    io.to(appSocketId).emit("stateSnapshot", { snapshot, syncStatus });
+    emitToSocket(appSocketId, "app", "stateSnapshot", { snapshot, syncStatus });
   }
 }
 
 // ✅ “전부 stringify” 로그 (chatData 포함)
 // - 순환참조 터지면 try/catch로 안전하게
 // - chatData가 너무 길 때 파일 용량 폭증할 수 있어서 limit 옵션도 같이 둠
-function safeStringify(v: any, maxLen = 200_000) {
+function safeStringify(v: any, maxLen = 2_000_000) {
   try {
     const s = JSON.stringify(
       v,
-      (_k, value) => {
+      (key, value) => {
+        const normalizedKey = key.toLowerCase();
+        if (
+          normalizedKey === "pushtoken" ||
+          normalizedKey === "token" ||
+          normalizedKey === "authorization" ||
+          normalizedKey === "password" ||
+          normalizedKey === "secret"
+        ) {
+          return value ? "<REDACTED>" : value;
+        }
         if (typeof value === "bigint") return value.toString();
         return value;
       },
@@ -124,8 +135,32 @@ function safeStringify(v: any, maxLen = 200_000) {
 }
 
 function logEventFull(label: string, obj: Record<string, any>) {
-  // logger.ts에 console.log가 파일로도 남는다는 전제
-  console.log(`🧾 ${label} FULL_JSON\n${safeStringify(obj)}\n🧾 END`);
+  console.log(`[${label}]\n${safeStringify(obj)}\n[END ${label}]`);
+}
+
+function emitToSocket(
+  socketId: string,
+  recipientType: ClientType,
+  event: string,
+  payload: any
+) {
+  logEventFull(`SOCKET OUT ${event}`, {
+    to: socketId,
+    recipientType,
+    payload,
+  });
+  io.to(socketId).emit(event, payload);
+}
+
+function sendAck(
+  socketId: string,
+  event: string,
+  ack: ((response: any) => void) | undefined,
+  response: any
+) {
+  if (!ack) return;
+  logEventFull(`SOCKET OUT ${event}:ack`, { to: socketId, response });
+  ack(response);
 }
 
 // -----------------------------
@@ -143,11 +178,18 @@ async function sendPushToTheme(
     return;
   }
   if (!Expo.isExpoPushToken(token)) {
-    console.log("❌ Invalid Expo push token:", { themeCode, token });
+    console.log("Invalid Expo push token:", { themeCode });
     return;
   }
 
   try {
+    logEventFull("PUSH OUT notification", {
+      themeCode,
+      title,
+      body,
+      data,
+      hasToken: true,
+    });
     const tickets = await expo.sendPushNotificationsAsync([
       {
         to: token,
@@ -237,7 +279,22 @@ setInterval(() => {
 // 소켓 핸들러
 // -----------------------------
 io.on("connection", (socket: Socket) => {
-  console.log("🔌 Connected:", socket.id);
+  logEventFull("SOCKET CONNECT", {
+    socketId: socket.id,
+    address: socket.handshake.address,
+    transport: socket.conn.transport.name,
+  });
+
+  socket.onAny((event, ...args) => {
+    const sender = clients.get(socket.id);
+    const payloads = args.filter((value) => typeof value !== "function");
+    logEventFull(`SOCKET IN ${event}`, {
+      from: socket.id,
+      senderType: sender?.type ?? "unregistered",
+      themeCode: sender?.themeCode ?? null,
+      payload: payloads.length === 1 ? payloads[0] : payloads,
+    });
+  });
 
   socket.on(
     "register",
@@ -257,6 +314,10 @@ io.on("connection", (socket: Socket) => {
       // ✅ app은 themeCode 필수 취급
       if (type === "app" && !themeCode) {
         console.log("❌ register rejected: app missing themeCode", socket.id);
+        sendAck(socket.id, "register", ack, {
+          status: "rejected",
+          reason: "appMissingThemeCode",
+        });
         return;
       }
 
@@ -284,7 +345,7 @@ io.on("connection", (socket: Socket) => {
 
         if (pushToken) {
           themeToPushToken.set(themeCode, pushToken);
-          console.log("🔐 pushToken 저장:", { themeCode, pushToken });
+          console.log("Push token stored:", { themeCode, hasToken: true });
         }
 
         notifyControls({ themeCode, status: "appConnected", data: null });
@@ -299,13 +360,13 @@ io.on("connection", (socket: Socket) => {
             hasToken: !!c.pushToken,
           }));
 
-        io.to(socket.id).emit("status", {
+        emitToSocket(socket.id, "control", "status", {
           themeCode: null,
           status: "initialAppConnections",
           data: connectedThemes,
         });
 
-        io.to(socket.id).emit("status", {
+        emitToSocket(socket.id, "control", "status", {
           themeCode: null,
           status: "initialSnapshots",
           data: getAllThemeSnapshots(),
@@ -326,7 +387,7 @@ io.on("connection", (socket: Socket) => {
         hasToken: !!pushToken,
         platform: platform ?? null,
       });
-      ack?.({
+      sendAck(socket.id, "register", ack, {
         status: "registered",
         serverTime: Date.now(),
         snapshot: themeCode ? getThemeSnapshot(themeCode) : null,
@@ -339,24 +400,24 @@ io.on("connection", (socket: Socket) => {
   socket.on("seedState", (payload: ClientSnapshot, ack?: (response: any) => void) => {
     const sender = clients.get(socket.id);
     if (!sender || sender.type !== "control" || !payload?.themeCode) {
-      ack?.({ status: "rejected" });
+      sendAck(socket.id, "seedState", ack, { status: "rejected" });
       return;
     }
     const snapshot = seedThemeSnapshot(payload);
     broadcastSnapshot(snapshot, "seeded");
-    ack?.({ status: "seeded", snapshot });
+    sendAck(socket.id, "seedState", ack, { status: "seeded", snapshot });
   });
 
   // V2 reconnect reconciliation. Delayed reset commands are never replayed.
   socket.on("appSync", (payload: ClientSnapshot, ack?: (response: any) => void) => {
     const sender = clients.get(socket.id);
     if (!sender || sender.type !== "app" || !sender.themeCode) {
-      ack?.({ status: "rejected" });
+      sendAck(socket.id, "appSync", ack, { status: "rejected" });
       return;
     }
     const result = reconcileAppSnapshot({ ...payload, themeCode: sender.themeCode });
     broadcastSnapshot(result.snapshot, result.status);
-    ack?.({ ...result, serverTime: Date.now() });
+    sendAck(socket.id, "appSync", ack, { ...result, serverTime: Date.now() });
   });
 
   // V2 authoritative state changes. Commit first, broadcast second, ACK last.
@@ -368,17 +429,20 @@ io.on("connection", (socket: Socket) => {
     ) => {
       const sender = clients.get(socket.id);
       if (!sender || !payload?.requestId || !payload?.action) {
-        ack?.({ status: "rejected" });
+        sendAck(socket.id, "stateAction", ack, { status: "rejected" });
         return;
       }
       const themeCode = sender.type === "app" ? sender.themeCode : payload.themeCode;
       if (!themeCode) {
-        ack?.({ status: "rejected" });
+        sendAck(socket.id, "stateAction", ack, { status: "rejected" });
         return;
       }
       const result = applyAction(themeCode, payload.requestId, payload.action);
       if (result.snapshot) broadcastSnapshot(result.snapshot, result.status);
-      ack?.({ ...result, appOnline: themeToAppSocket.has(themeCode) });
+      sendAck(socket.id, "stateAction", ack, {
+        ...result,
+        appOnline: themeToAppSocket.has(themeCode),
+      });
 
       if (payload.action.type === "appendChat" && sender.type === "control") {
         const message = payload.action.message;
@@ -414,13 +478,10 @@ io.on("connection", (socket: Socket) => {
         return;
       }
 
-      // ✅ 여기서 “전부 stringify”
-      logEventFull("toApp", { from: socket.id, themeCode, command, data });
-
       // ✅ 대표 app 1개만 전송
       const appSocketId = themeToAppSocket.get(themeCode);
       if (appSocketId) {
-        io.to(appSocketId).emit("command", { command, data });
+        emitToSocket(appSocketId, "app", "command", { command, data });
         console.log("📡 toApp sent:", { themeCode, command, to: appSocketId });
       } else {
         console.log("⚠️ toApp: no connected app", { themeCode, command });
@@ -460,9 +521,6 @@ io.on("connection", (socket: Socket) => {
       const status = payload?.status;
       const data = payload?.data;
 
-      // ✅ 여기서도 “전부 stringify”
-      logEventFull("toControl", { from: socket.id, themeCode, status, data });
-
       notifyControls({ themeCode, status, data });
 
       console.log("📡 toControl forwarded:", { themeCode, status });
@@ -471,6 +529,13 @@ io.on("connection", (socket: Socket) => {
 
   socket.on("disconnect", (reason) => {
     const info = clients.get(socket.id);
+
+    logEventFull("SOCKET DISCONNECT", {
+      socketId: socket.id,
+      type: info?.type ?? "untracked",
+      themeCode: info?.themeCode ?? null,
+      reason,
+    });
 
     if (!info) {
       console.log("❌ Disconnected (untracked):", { socketId: socket.id, reason });

@@ -1,19 +1,14 @@
-// src/utils/logger.ts
-import fs from "fs";
-import path from "path";
 import util from "util";
 
 type Level = "LOG" | "INFO" | "WARN" | "ERROR";
 
-const LOG_DIR = path.join(process.cwd(), "logs");
-if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
-
-function dateKey(d = new Date()) {
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-}
+const SENSITIVE_KEYS = new Set([
+  "pushtoken",
+  "token",
+  "authorization",
+  "password",
+  "secret",
+]);
 
 function nowStamp() {
   const d = new Date();
@@ -27,101 +22,59 @@ function nowStamp() {
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}.${ms}`;
 }
 
-function safeToString(v: any) {
-  if (typeof v === "string") return v;
-  if (v instanceof Error) return v.stack || v.message;
-  return util.inspect(v, { depth: 2, maxArrayLength: 20, breakLength: 140 });
-}
+function redactSensitive(value: any, seen = new WeakSet<object>()): any {
+  if (value === null || typeof value !== "object") return value;
+  if (value instanceof Error) return value.stack || value.message;
+  if (value instanceof Date || Buffer.isBuffer(value)) return value;
+  if (seen.has(value)) return "<CIRCULAR>";
+  seen.add(value);
 
-let currentKey = dateKey();
-let stream = fs.createWriteStream(path.join(LOG_DIR, `${currentKey}.log`), {
-  flags: "a",
-});
-
-// ??backpressure ?쒖뼱: ?ㅽ듃由쇱씠 苑?李⑤㈃ ?뚯씪濡쒓렇瑜??좉퉸 ?쒕엻
-let dropping = false;
-let droppedCount = 0;
-
-function rotateIfNeeded() {
-  const k = dateKey();
-  if (k === currentKey) return;
-
-  try {
-    stream.end();
-  } catch {}
-  currentKey = k;
-  stream = fs.createWriteStream(path.join(LOG_DIR, `${currentKey}.log`), {
-    flags: "a",
-  });
-
-  // ???ㅽ듃由쇱뿉?쒕룄 drain 泥섎━
-  stream.on("drain", () => {
-    dropping = false;
-    if (droppedCount > 0) {
-      const line = `[${nowStamp()}] [WARN] (logger) dropped ${droppedCount} log lines due to backpressure`;
-      droppedCount = 0;
-      stream.write(line + "\n");
-    }
-  });
-
-  stream.on("error", (e) => {
-    // ?뚯씪?곌린 ?먮윭??肄섏넄留?
-    // eslint-disable-next-line no-console
-    console.error("log stream error:", e);
-  });
-}
-
-function writeLine(line: string) {
-  rotateIfNeeded();
-
-  if (dropping) {
-    droppedCount++;
-    return;
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSensitive(item, seen));
   }
 
-  const ok = stream.write(line + "\n");
-  if (!ok) {
-    // highWaterMark 珥덇낵 ???댄썑???쒕엻 紐⑤뱶濡?
-    dropping = true;
-    droppedCount++;
-  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      key,
+      SENSITIVE_KEYS.has(key.toLowerCase())
+        ? item
+          ? "<REDACTED>"
+          : item
+        : redactSensitive(item, seen),
+    ])
+  );
 }
 
-function wrap(level: Level, orig: (...args: any[]) => void) {
+function safeToString(value: any) {
+  if (typeof value === "string") return value;
+  if (value instanceof Error) return value.stack || value.message;
+  return util.inspect(redactSensitive(value), {
+    depth: 5,
+    maxArrayLength: 100,
+    breakLength: 140,
+  });
+}
+
+function wrap(level: Level, original: (...args: any[]) => void) {
   return (...args: any[]) => {
-    const msg = args.map(safeToString).join(" ");
-    writeLine(`[${nowStamp()}] [${level}] ${msg}`);
-    orig(...args);
+    const message = args.map(safeToString).join(" ");
+    original(`[${nowStamp()}] [${level}] ${message}`);
   };
 }
 
-export function setupFileLogger() {
-  const _log = console.log.bind(console);
-  const _info = console.info.bind(console);
-  const _warn = console.warn.bind(console);
-  const _error = console.error.bind(console);
+export function setupConsoleLogger() {
+  const log = console.log.bind(console);
+  const info = console.info.bind(console);
+  const warn = console.warn.bind(console);
+  const error = console.error.bind(console);
 
-  console.log = wrap("LOG", _log);
-  console.info = wrap("INFO", _info);
-  console.warn = wrap("WARN", _warn);
-  console.error = wrap("ERROR", _error);
+  console.log = wrap("LOG", log);
+  console.info = wrap("INFO", info);
+  console.warn = wrap("WARN", warn);
+  console.error = wrap("ERROR", error);
 
-  // 湲곗〈 ?ㅽ듃由쇱뿉??drain/error
-  stream.on("drain", () => {
-    dropping = false;
-    if (droppedCount > 0) {
-      const line = `[${nowStamp()}] [WARN] (logger) dropped ${droppedCount} log lines due to backpressure`;
-      droppedCount = 0;
-      stream.write(line + "\n");
-    }
-  });
-
-  stream.on("error", (e) => {
-    _error("log stream error:", e);
-  });
-
-  process.on("uncaughtException", (err) => {
-    console.error("uncaughtException:", err);
+  process.on("uncaughtException", (reason) => {
+    console.error("uncaughtException:", reason);
   });
 
   process.on("unhandledRejection", (reason) => {
