@@ -133,15 +133,20 @@ function notifyControls(payload: {
   }
 }
 
-function broadcastSnapshot(snapshot: ThemeSnapshot, syncStatus: string) {
+function broadcastSnapshot(
+  snapshot: ThemeSnapshot,
+  syncStatus: string,
+  actionType?: StateAction["type"]
+) {
+  const payload = { snapshot, syncStatus, actionType };
   notifyControls({
     themeCode: snapshot.themeCode,
     status: "stateSnapshot",
-    data: { snapshot, syncStatus },
+    data: payload,
   });
   const appSocketId = themeToAppSocket.get(snapshot.themeCode);
   if (appSocketId) {
-    emitToSocket(appSocketId, "app", "stateSnapshot", { snapshot, syncStatus });
+    emitToSocket(appSocketId, "app", "stateSnapshot", payload);
   }
 }
 
@@ -481,7 +486,7 @@ io.on("connection", (socket: Socket) => {
       }
       const result = applyAction(themeCode, payload.requestId, payload.action);
       if (result.snapshot && result.status !== "alreadyApplied") {
-        broadcastSnapshot(result.snapshot, result.status);
+        broadcastSnapshot(result.snapshot, result.status, payload.action.type);
       }
       sendAck(socket.id, "stateAction", ack, {
         ...result,
@@ -591,9 +596,9 @@ io.on("connection", (socket: Socket) => {
     if (type === "app" && themeCode) {
       if (themeToAppSocket.get(themeCode) === socket.id) {
         themeToAppSocket.delete(themeCode);
+        notifyControls({ themeCode, status: "appDisconnected", data: { reason } });
+        console.log("⚠️ Notified control: appDisconnected", { themeCode, reason });
       }
-      notifyControls({ themeCode, status: "appDisconnected", data: { reason } });
-      console.log("⚠️ Notified control: appDisconnected", { themeCode, reason });
     }
 
     clients.delete(socket.id);
