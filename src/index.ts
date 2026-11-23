@@ -80,6 +80,98 @@ const clients: Map<string, ClientInfo> = new Map();
 const themeToAppSocket: Map<string, string> = new Map();
 const themeToPushToken = loadPushTokens();
 
+type BlackoutState = {
+  themeCode: string;
+  active: boolean;
+  expiresAt: number | null;
+  revision: number;
+};
+const blackoutPath = process.env.HINT_BLACKOUT_FILE || path.join(process.cwd(), "data", "blackouts.json");
+const blackoutTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const blackoutApplied = new Map<string, { revision: number; socketId: string }>();
+
+function loadBlackouts(): Map<string, BlackoutState> {
+  try {
+    if (!fs.existsSync(blackoutPath)) return new Map();
+    const parsed = JSON.parse(fs.readFileSync(blackoutPath, "utf-8"));
+    if (!Array.isArray(parsed)) return new Map();
+    return new Map(parsed.filter((entry): entry is BlackoutState =>
+      typeof entry?.themeCode === "string" &&
+      typeof entry?.active === "boolean" &&
+      Number.isSafeInteger(entry?.revision) &&
+      (entry.expiresAt === null || Number.isFinite(entry.expiresAt))
+    ).map((entry) => [entry.themeCode, entry]));
+  } catch (error) {
+    console.error("Blackout state load failed:", error);
+    return new Map();
+  }
+}
+
+const blackouts = loadBlackouts();
+
+function persistBlackouts() {
+  try {
+    fs.mkdirSync(path.dirname(blackoutPath), { recursive: true });
+    const tempPath = `${blackoutPath}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify([...blackouts.values()], null, 2), "utf-8");
+    fs.renameSync(tempPath, blackoutPath);
+  } catch (error) {
+    console.error("Blackout state save failed:", error);
+  }
+}
+
+function getBlackout(themeCode: string): BlackoutState {
+  return blackouts.get(themeCode) || { themeCode, active: false, expiresAt: null, revision: 0 };
+}
+
+function publishBlackout(state: BlackoutState) {
+  const appSocketId = themeToAppSocket.get(state.themeCode);
+  notifyControls({
+    themeCode: state.themeCode,
+    status: "blackoutState",
+    data: { ...state, appConnected: Boolean(appSocketId), applied: Boolean(
+      appSocketId && blackoutApplied.get(state.themeCode)?.revision === state.revision &&
+      blackoutApplied.get(state.themeCode)?.socketId === appSocketId
+    ) },
+  });
+  if (appSocketId) emitToSocket(appSocketId, "app", "blackoutState", state);
+}
+
+function scheduleBlackoutEnd(state: BlackoutState) {
+  const previous = blackoutTimers.get(state.themeCode);
+  if (previous) clearTimeout(previous);
+  blackoutTimers.delete(state.themeCode);
+  if (!state.active || state.expiresAt === null) return;
+  const remaining = state.expiresAt - Date.now();
+  if (remaining <= 0) {
+    setBlackout(state.themeCode, false);
+    return;
+  }
+  blackoutTimers.set(state.themeCode, setTimeout(() => {
+    if (getBlackout(state.themeCode).revision === state.revision) {
+      setBlackout(state.themeCode, false);
+    }
+  }, remaining));
+}
+
+function setBlackout(themeCode: string, active: boolean, durationSeconds = 0): BlackoutState {
+  const previous = getBlackout(themeCode);
+  const state: BlackoutState = {
+    themeCode,
+    active,
+    expiresAt: active ? Date.now() + durationSeconds * 1000 : null,
+    revision: previous.revision + 1,
+  };
+  blackouts.set(themeCode, state);
+  blackoutApplied.delete(themeCode);
+  persistBlackouts();
+  scheduleBlackoutEnd(state);
+  publishBlackout(state);
+  return state;
+}
+
+for (const state of [...blackouts.values()]) scheduleBlackoutEnd(state);
+
 const expo = new Expo();
 
 // -----------------------------
@@ -388,6 +480,7 @@ io.on("connection", (socket: Socket) => {
 
       if (type === "app" && themeCode) {
         themeToAppSocket.set(themeCode, socket.id);
+        blackoutApplied.delete(themeCode);
 
         if (pushToken) {
           themeToPushToken.set(themeCode, pushToken);
@@ -396,6 +489,7 @@ io.on("connection", (socket: Socket) => {
         }
 
         notifyControls({ themeCode, status: "appConnected", data: null });
+        publishBlackout(getBlackout(themeCode));
         console.log("🔔 Notified control: appConnected", { themeCode });
       }
 
@@ -417,6 +511,15 @@ io.on("connection", (socket: Socket) => {
           themeCode: null,
           status: "initialSnapshots",
           data: getAllThemeSnapshots(),
+        });
+        emitToSocket(socket.id, "control", "status", {
+          themeCode: null,
+          status: "initialBlackouts",
+          data: [...blackouts.values()].map((state) => ({
+            ...state,
+            appConnected: Boolean(themeToAppSocket.get(state.themeCode)),
+            applied: Boolean(blackoutApplied.get(state.themeCode)),
+          })),
         });
 
         console.log("📤 Sent to control: initialAppConnections", {
@@ -527,6 +630,22 @@ io.on("connection", (socket: Socket) => {
         return;
       }
 
+      if (command === "lightOff") {
+        const duration = Number(data?.duration ?? data?.lightOffTime);
+        if (typeof themeCode !== "string" || !themeCode ||
+            !Number.isSafeInteger(duration) || duration < 1 || duration > 86400) {
+          notifyControls({ themeCode: typeof themeCode === "string" ? themeCode : null,
+            status: "blackoutError", data: "암전 시간은 1~86400초여야 합니다." });
+          return;
+        }
+        setBlackout(themeCode, true, duration);
+        return;
+      }
+      if (command === "lightOn") {
+        if (typeof themeCode === "string" && themeCode) setBlackout(themeCode, false);
+        return;
+      }
+
       // ✅ 대표 app 1개만 전송
       const appSocketId = themeToAppSocket.get(themeCode);
       if (appSocketId) {
@@ -555,6 +674,17 @@ io.on("connection", (socket: Socket) => {
       }
     }
   );
+
+  socket.on("blackoutAck", (payload: { revision?: number; active?: boolean }) => {
+    const sender = clients.get(socket.id);
+    if (sender?.type !== "app" || !sender.themeCode ||
+        themeToAppSocket.get(sender.themeCode) !== socket.id) return;
+    const state = getBlackout(sender.themeCode);
+    if (payload?.revision !== state.revision || payload?.active !== state.active) return;
+    blackoutApplied.set(sender.themeCode, { revision: state.revision, socketId: socket.id });
+    notifyControls({ themeCode: sender.themeCode, status: "blackoutApplied",
+      data: { revision: state.revision, active: state.active } });
+  });
 
   // ✅ toControl은 app만 허용 + themeCode는 sender 기준으로 강제(위조 차단)
   socket.on(
@@ -596,7 +726,9 @@ io.on("connection", (socket: Socket) => {
     if (type === "app" && themeCode) {
       if (themeToAppSocket.get(themeCode) === socket.id) {
         themeToAppSocket.delete(themeCode);
+        blackoutApplied.delete(themeCode);
         notifyControls({ themeCode, status: "appDisconnected", data: { reason } });
+        publishBlackout(getBlackout(themeCode));
         console.log("⚠️ Notified control: appDisconnected", { themeCode, reason });
       }
     }

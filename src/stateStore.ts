@@ -179,6 +179,10 @@ export function applyAction(themeCode: string, requestId: string, action: StateA
   let next: ThemeSnapshot = { ...existing, updatedAt: now(), lastRequestId: requestId };
 
   if (action.type === "reset") {
+    const requestedDuration = Number(action.durationMs);
+    const resetDuration = Number.isFinite(requestedDuration)
+      ? Math.max(0, requestedDuration)
+      : Math.max(0, Number(existing.remainingTime || 0));
     const alreadyReset =
       existing.isRunning === 0 &&
       existing.hintCount === 0 &&
@@ -195,13 +199,22 @@ export function applyAction(themeCode: string, requestId: string, action: StateA
         isRunning: 0,
         startedAt: null,
         endTime: 0,
-        remainingTime: Number(action.durationMs || 0),
+        remainingTime: resetDuration,
         progress: 0,
         progressIndex: 0,
         hintCount: 0,
         usedHintCodes: [],
         chatData: [],
         resetAt: now(),
+      };
+    } else {
+      // Repeated resets must refresh the configured idle timer too.
+      next = {
+        ...next,
+        isRunning: 0,
+        startedAt: null,
+        endTime: 0,
+        remainingTime: resetDuration,
       };
     }
   } else {
